@@ -268,7 +268,7 @@ class JobConfig:
         self.parser.add_argument(
             "--training.prefetch_factor",
             type=int,
-            default=2,
+            default=None,
             help="Number of batches loaded in advance by each worker."
             "2 means there will be a total of 2 * num_workers batches prefetched across all workers.",
         )

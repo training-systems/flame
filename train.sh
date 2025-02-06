@@ -61,11 +61,11 @@ echo "Launching training..."
 set -x
 path=$(grep -oP '(?<=--job.dump_folder )[^ ]+' <<< "$params")
 mkdir -p $path
-cp * $path
-cp -r configs $path
-cp -r flame   $path
-cp -r 3rdparty/flash-linear-attention/fla $path
-cp -r 3rdparty/torchtitan/torchtitan $path
+# cp * $path
+# cp -r configs $path
+# cp -r flame   $path
+# cp -r 3rdparty/flash-linear-attention/fla $path
+# cp -r 3rdparty/torchtitan/torchtitan $path
 
 # for offline systems
 # export TRANSFORMERS_OFFLINE=1

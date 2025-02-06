@@ -448,7 +448,7 @@ class DPAwareDataLoader(StatefulDataLoader, Stateful):
         collate_fn: Callable,
         num_workers: int = 0,
         pin_memory: bool = False,
-        prefetch_factor: int = 2,
+        prefetch_factor: int = None,
         persistent_workers: bool = False,
         snapshot_every_n_steps: Optional[int] = 1
     ):
