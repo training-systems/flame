@@ -46,3 +46,6 @@ __pycache__
 
 # macOS
 .DS_Store
+
+# hostfile
+hostfile
