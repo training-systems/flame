@@ -9,14 +9,15 @@
     "initializer_range": 0.02,
     "max_position_embeddings": 8192,
     "model_type": "t6",
-    "hidden_size": 4096,
+    "hidden_size": 2560,
     "num_attention_heads": 32,
-    "num_hidden_layers": 24,
+    "intermediate_size": 6144,
+    "head_dim": 128,
+    "num_hidden_layers": 60,
     "norm_eps": 1e-06,
     "tie_word_embeddings": true,
     "use_cache": true,
     "rank": 4,
     "q_rank": 8,
-    "block_size": 1024,
     "bias": false
 }
