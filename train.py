@@ -24,6 +24,8 @@ from flame.optimizer import build_lr_schedulers, build_optimizers
 from flame.parallelisms.parallelize_fla import parallelize_fla
 from flame.parallelisms.pipeline_fla import pipeline_fla
 from flame.utils import device_module, device_type
+from models.configuration_t6 import T6Config
+from models.modeling_t6 import T6ForCausalLM, T6Model
 from torchtitan.float8 import Float8Handler
 from torchtitan.logging import init_logger, logger
 from torchtitan.parallelisms import ParallelDims
@@ -99,7 +101,11 @@ def main(job_config: JobConfig):
     )
 
     min_num_shards = dp_degree * job_config.training.num_workers
+
     if len(job_config.training.dataset.split(',')) == 1:
+        logger.info(f"[DEBUG] job_config.training.dataset, {job_config.training.dataset}")
+        logger.info(f"[DEBUG] job_config.training.dataset_name, {job_config.training.dataset_name}")
+    
         dataset = load_dataset(
             path=job_config.training.dataset,
             name=getattr(job_config.training, 'dataset_name', None),
@@ -262,7 +268,8 @@ def main(job_config: JobConfig):
     )
 
     logger.info(f"Loading model config from {job_config.model.config}")
-    model_config = AutoConfig.from_pretrained(job_config.model.config)
+    # model_config = AutoConfig.from_pretrained(job_config.model.config)
+    model_config = T6Config.from_pretrained(job_config.model.config)
     # set the model configs from training inputs:
     # 1. norm type to decide which norm layer to use
     # 2. vocab size from tokenizer
@@ -271,7 +278,8 @@ def main(job_config: JobConfig):
 
     logger.info(f"Building model from the config\n{color.green}{model_config}{color.reset}")
     with torch.device('meta'):
-        model = AutoModelForCausalLM.from_config(model_config)
+        # model = AutoModelForCausalLM.from_config(model_config)
+        model = T6ForCausalLM(model_config)
         # defer weight initialization until after parallelisms are applied
         model.apply(lambda m: setattr(m, '_is_hf_initialized', False))
     logger.info(f"{color.blue}\n{model}{color.reset}\n")

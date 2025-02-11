@@ -1,60 +1,33 @@
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple, Union
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PreTrainedModel
-from transformers.utils import ModelOutput
+from transformers.activations import ACT2FN
+from transformers.generation import GenerationMixin
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPast,
+    CausalLMOutputWithPast,
+)
 
 from models.configuration_t6 import T6Config
 
 
-@dataclass
-class T6Output(ModelOutput):
-    logits: Optional[torch.Tensor] = None
-    loss: Optional[torch.Tensor] = None
-
-
-class RMSNorm(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        eps: float = 1e-6,
-        elementwise_affine=True,
-        memory_efficient=False,
-    ):
-        super().__init__()
-        self.dim = dim
-        self.eps = eps
-        self.elementwise_affine = elementwise_affine
-        if self.elementwise_affine:
-            self.weight = nn.Parameter(torch.ones(dim))
-        else:
-            self.register_parameter("weight", None)
-
-    def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
-    def forward(self, x):
-        output = self._norm(x.float()).type_as(x)
-        if self.weight is not None:
-            output = output * self.weight
-        return output
-
-    def extra_repr(self) -> str:
-        return f"dim={self.dim}, eps={self.eps}, elementwise_affine={self.elementwise_affine}"
-
-
 class Rotary(torch.nn.Module):
-    def __init__(self, dim, base=10000):
+    def __init__(self, dim, base=10000, device=None):
         super().__init__()
         # 预先计算逆频率
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        inv_freq = 1.0 / (
+            base
+            ** (torch.arange(0, dim, 2, dtype=torch.int64).float().to(device) / dim)
+        )
         # 注册为 buffer，确保在 model.to(device) 时跟随转移，并避免 meta tensor 问题
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+
         self.seq_len_cached = None
         self.cos_cached = None
         self.sin_cached = None
@@ -65,8 +38,8 @@ class Rotary(torch.nn.Module):
             self.seq_len_cached = seq_len
             t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
             freqs = torch.outer(t, self.inv_freq).to(x.device)
-            self.cos_cached = freqs.cos().bfloat16()
-            self.sin_cached = freqs.sin().bfloat16()
+            self.cos_cached = freqs.cos().to(dtype=x.dtype)
+            self.sin_cached = freqs.sin().to(dtype=x.dtype)
         return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
 
 
@@ -82,32 +55,58 @@ def apply_rotary_emb(x, cos, sin):
 
 class CPLinear(nn.Module):
     # Bilinear form of x using CP decomposition
-    def __init__(self, in_features, n_head, head_dim, rank: int = 1, q_rank: int = 12):
-        super(CPLinear, self).__init__()
-        self.in_features = in_features
-        self.n_head = n_head
-        self.head_dim = head_dim
-        self.rank = rank
-        self.q_rank = q_rank
+    def __init__(self, config: T6Config):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.n_head = config.num_attention_heads
+        self.head_dim = config.head_dim
+        self.rank = config.rank
+        self.q_rank = config.q_rank
+        self.attention_bias = config.attention_bias
 
         # Define linear transformations for A projections
-        self.W_A_q = nn.Linear(in_features, n_head * q_rank, bias=False)
-        self.W_A_k = nn.Linear(in_features, n_head * rank, bias=False)
-        self.W_A_v = nn.Linear(in_features, n_head * rank, bias=False)
+        self.W_A_q = nn.Linear(
+            self.hidden_size,
+            self.n_head * self.q_rank,
+            bias=self.attention_bias,
+        )
+        self.W_A_k = nn.Linear(
+            self.hidden_size,
+            self.n_head * self.rank,
+            bias=self.attention_bias,
+        )
+        self.W_A_v = nn.Linear(
+            self.hidden_size,
+            self.n_head * self.rank,
+            bias=self.attention_bias,
+        )
 
         # Define B projection parameters for Q, K, V
-        self.W_B_q = nn.Linear(in_features, q_rank * head_dim, bias=False)
-        self.W_B_k = nn.Linear(in_features, rank * head_dim, bias=False)
-        self.W_B_v = nn.Linear(in_features, rank * head_dim, bias=False)
+        self.W_B_q = nn.Linear(
+            self.hidden_size,
+            self.q_rank * self.head_dim,
+            bias=self.attention_bias,
+        )
+        self.W_B_k = nn.Linear(
+            self.hidden_size,
+            self.rank * self.head_dim,
+            bias=self.attention_bias,
+        )
+        self.W_B_v = nn.Linear(
+            self.hidden_size,
+            self.rank * self.head_dim,
+            bias=self.attention_bias,
+        )
         self.rotary = Rotary(self.head_dim)
         self.reset_parameters()
 
     def reset_parameters(self):
         W_A_q_tensor = self.W_A_q.weight.view(
-            self.in_features, self.n_head, self.q_rank
+            self.hidden_size, self.n_head, self.q_rank
         )
-        W_A_k_tensor = self.W_A_k.weight.view(self.in_features, self.n_head, self.rank)
-        W_A_v_tensor = self.W_A_v.weight.view(self.in_features, self.n_head, self.rank)
+        W_A_k_tensor = self.W_A_k.weight.view(self.hidden_size, self.n_head, self.rank)
+        W_A_v_tensor = self.W_A_v.weight.view(self.hidden_size, self.n_head, self.rank)
         nn.init.xavier_uniform_(W_A_q_tensor)
         nn.init.xavier_uniform_(W_A_k_tensor)
         nn.init.xavier_uniform_(W_A_v_tensor)
@@ -116,13 +115,13 @@ class CPLinear(nn.Module):
         self.W_A_v.weight.data = W_A_v_tensor.view_as(self.W_A_v.weight)
 
         W_B_q_tensor = self.W_B_q.weight.view(
-            self.in_features, self.q_rank, self.head_dim
+            self.hidden_size, self.q_rank, self.head_dim
         )
         W_B_k_tensor = self.W_B_k.weight.view(
-            self.in_features, self.rank, self.head_dim
+            self.hidden_size, self.rank, self.head_dim
         )
         W_B_v_tensor = self.W_B_v.weight.view(
-            self.in_features, self.rank, self.head_dim
+            self.hidden_size, self.rank, self.head_dim
         )
         nn.init.xavier_uniform_(W_B_q_tensor)
         nn.init.xavier_uniform_(W_B_k_tensor)
@@ -180,26 +179,23 @@ class CPLinear(nn.Module):
 class CausalSelfAttention(nn.Module):
     def __init__(self, config: T6Config):
         super().__init__()
-        self.n_head = config.n_head
+        self.config = config
+        self.n_head = config.num_attention_heads
         self.head_dim = config.head_dim
-        self.n_embd = config.hidden_size  # Fixed embedding dimension
-        self.rank = config.rank
-        self.q_rank = config.q_rank
 
         # CPLinear projections directly output multi-head dimensions
-        self.c_qkv = CPLinear(
-            self.n_embd, self.n_head, self.head_dim, self.rank, self.q_rank
-        )
+        self.c_qkv = CPLinear(config)
 
         # Output projection from (n_head * head_dim) back to n_embd
-        self.c_proj = nn.Linear(self.n_head * self.head_dim, self.n_embd, bias=False)
+        self.c_proj = nn.Linear(
+            config.num_attention_heads * config.head_dim,
+            config.hidden_size,
+            bias=config.attention_bias,
+        )
         self.c_proj.weight.data.zero_()
 
         # Add group norm
-        self.using_groupnorm = getattr(config, "using_groupnorm", False)
-        if self.using_groupnorm:
-            # Apply RMSNorm to each head's output dimension
-            self.subln = RMSNorm(self.head_dim, eps=1e-5, elementwise_affine=True)
+        self.using_groupnorm = config.using_groupnorm
 
     def forward(self, x):
         B, T, C = x.size()  # (batch_size, seq_length, n_embd)
@@ -217,7 +213,8 @@ class CausalSelfAttention(nn.Module):
 
         if self.using_groupnorm:
             # Apply RMSNorm directly to each head's output
-            y = self.subln(y)
+            # y = self.subln(y)
+            y = F.rms_norm(y, (self.head_dim,), eps=self.config.rms_norm_eps)
 
         y = y.transpose(1, 2).contiguous().view(B, T, self.n_head * self.head_dim)
         y = self.c_proj(y)
@@ -231,11 +228,13 @@ class MLP(nn.Module):
         hidden_dim = math.floor(8 / 3 * config.hidden_size)
 
         # Split the linear projection into two parts for SwiGLU
-        self.c_fc1 = nn.Linear(config.hidden_size, hidden_dim, bias=False)
-        self.c_fc2 = nn.Linear(config.hidden_size, hidden_dim, bias=False)
+        self.c_fc1 = nn.Linear(config.hidden_size, hidden_dim, bias=config.mlp_bias)
+        self.c_fc2 = nn.Linear(config.hidden_size, hidden_dim, bias=config.mlp_bias)
 
         # Output projection
-        self.c_proj = nn.Linear(hidden_dim, config.hidden_size, bias=False)
+        self.c_proj = nn.Linear(hidden_dim, config.hidden_size, bias=config.mlp_bias)
+        self.act_fn = ACT2FN[config.hidden_act]
+
         self.c_proj.weight.data.zero_()  # zero init suggested by @Grad62304977
 
     def forward(self, x):
@@ -244,7 +243,7 @@ class MLP(nn.Module):
         x2 = self.c_fc2(x)
 
         # Apply the SwiGLU gating: SILU on one projection, and gate with the other
-        x = F.silu(x1) * x2
+        x = self.act_fn(x1) * x2
 
         # Apply the final output projection
         x = self.c_proj(x)
@@ -254,73 +253,88 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, config: T6Config):
         super().__init__()
+        self.config = config
         self.attn = CausalSelfAttention(config)
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(F.rms_norm(x, (x.size(-1),)))
-        x = x + self.mlp(F.rms_norm(x, (x.size(-1),)))
+        norm1 = F.rms_norm(x, (x.size(-1),), eps=self.config.rms_norm_eps)
+        attn_out = self.attn(norm1)
+        x = x + attn_out
+
+        norm2 = F.rms_norm(x, (x.size(-1),), eps=self.config.rms_norm_eps)
+        mlp_out = self.mlp(norm2)
+        x = x + mlp_out
         return x
 
 
-# -----------------------------------------------------------------------------
-# The main GPT-2 model
-
-
-class T6(PreTrainedModel):
+class T6PreTrainedModel(PreTrainedModel):
     config_class = T6Config
-    base_model_prefix = "t6"
+    base_model_prefix = "model"
     supports_gradient_checkpointing = True
 
+    def _init_weights(self, module):
+        std = self.config.initializer_range
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
+
+
+class T6Model(T6PreTrainedModel):
     def __init__(self, config: T6Config):
         super().__init__(config)
-        self.config = config
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
 
-        self.transformer = nn.ModuleDict(
-            dict(
-                wte=nn.Embedding(config.vocab_size, config.hidden_size),
-                h=nn.ModuleList(
-                    [Block(config) for _ in range(config.num_hidden_layers)]
-                ),
-            )
+        self.embed_tokens = nn.Embedding(
+            config.vocab_size, config.hidden_size, self.padding_idx
         )
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.transformer.wte.weight = self.lm_head.weight  # Weight tying
+        self.layers = nn.ModuleList(
+            [Block(config) for _ in range(config.num_hidden_layers)]
+        )
+
+        self.gradient_checkpointing = False
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.embed_tokens = value
 
     def forward(
-        self, input_ids, labels=None, return_logits=True, output_all_seq=False, **kwargs
-    ) -> T6Output:
-        # forward the GPT model itself
-        x = self.transformer.wte(input_ids)  # token embeddings of shape (b, t, n_embd)
-        for block in self.transformer.h:
-            x = block(x)
-        x = F.rms_norm(x, (x.size(-1),))
+        self,
+        input_ids: torch.LongTensor,
+        labels: Optional[torch.LongTensor] = None,
+        return_logits: bool = True,
+        output_all_seq: bool = False,
+        **kwargs,
+    ) -> Union[Tuple, CausalLMOutputWithPast]:
+        inputs_embeds = self.embed_tokens(input_ids)
 
-        if labels is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
-            logits = logits.float()  # use tf32/fp32 for logits
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-1
-            )
-        elif output_all_seq:
-            logits = self.lm_head(
-                x[:, :, :]
-            )  # note: using list [-1] to preserve the time dim
-            loss = None
-        else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(
-                x[:, [-1], :]
-            )  # note: using list [-1] to preserve the time dim
-            logits = logits.float()  # use tf32/fp32 for logits
-            loss = None
+        hidden_states = inputs_embeds
 
-        # there are performance reasons why not returning logits is prudent, if not needed
-        if not return_logits:
-            logits = None
+        # 打印每一层的输出信息
+        for i, layer in enumerate(self.layers):
+            hidden_states = layer(hidden_states)
 
-        return T6Output(logits=logits, loss=loss)
+        hidden_states = F.rms_norm(
+            hidden_states, (self.config.hidden_size,), eps=self.config.rms_norm_eps
+        )
+
+        output = BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            # past_key_values=past_key_values if use_cache else None,
+            # hidden_states=all_hidden_states,
+            # attentions=all_self_attns,
+        )
+        return output
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -382,3 +396,81 @@ class T6(PreTrainedModel):
             pretrained_model_name_or_path, config=config, *model_args, **kwargs
         )
         return model
+
+
+class T6ForCausalLM(T6PreTrainedModel, GenerationMixin):
+    _tied_weights_keys = ["lm_head.weight"]
+    _tp_plan = {"lm_head": "colwise_rep"}
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.model = T6Model(config)
+        self.vocab_size = config.vocab_size
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
+
+    def set_decoder(self, decoder):
+        self.model = decoder
+
+    def get_decoder(self):
+        return self.model
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        labels: Optional[torch.LongTensor] = None,
+        return_logits: bool = True,
+        output_all_seq: bool = False,
+        return_dict: bool = True,
+        **kwargs,
+    ) -> Union[Tuple, CausalLMOutputWithPast]:
+        outputs = self.model(
+            input_ids=input_ids,
+            # attention_mask=attention_mask,
+            # position_ids=position_ids,
+            # past_key_values=past_key_values,
+            # inputs_embeds=inputs_embeds,
+            # use_cache=use_cache,
+            # output_attentions=output_attentions,
+            # output_hidden_states=output_hidden_states,
+            # return_dict=return_dict,
+            # cache_position=cache_position,
+            **kwargs,
+        )
+        hidden_states = outputs[0]
+
+        # logits = self.lm_head(hidden_states[:, -num_logits_to_keep:, :])
+        logits = self.lm_head(hidden_states)
+        loss = None
+        if labels is not None:
+            loss = self.loss_function(
+                logits=logits,
+                labels=labels,
+                vocab_size=self.config.vocab_size,
+                **kwargs,
+            )
+        if not return_dict:
+            output = (logits,) + outputs[1:]
+            return (loss,) + output if loss is not None else output
+
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
