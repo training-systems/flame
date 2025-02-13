@@ -274,7 +274,7 @@ def main(job_config: JobConfig):
     # 1. norm type to decide which norm layer to use
     # 2. vocab size from tokenizer
     # 3. context_len base on inputs
-    model_config.vocab_size = tokenizer.vocab_size
+    model_config.vocab_size = len(tokenizer.get_vocab())
 
     logger.info(f"Building model from the config\n{color.green}{model_config}{color.reset}")
     with torch.device('meta'):
