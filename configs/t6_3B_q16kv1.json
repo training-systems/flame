@@ -5,7 +5,7 @@
     "eos_token_id": 2,
     "fuse_cross_entropy": true,
     "fuse_norm": true,
-    "hidden_act": "silu",
+    "hidden_act": "swish",
     "initializer_range": 0.02,
     "max_position_embeddings": 8192,
     "model_type": "t6",
@@ -17,7 +17,7 @@
     "norm_eps": 1e-06,
     "tie_word_embeddings": true,
     "use_cache": true,
-    "rank": 4,
-    "q_rank": 8,
+    "rank": 1,
+    "q_rank": 16,
     "bias": false
 }
