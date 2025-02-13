@@ -21,10 +21,7 @@ class Rotary(torch.nn.Module):
     def __init__(self, dim, base=10000, device=None):
         super().__init__()
         # 预先计算逆频率
-        inv_freq = 1.0 / (
-            base
-            ** (torch.arange(0, dim, 2, dtype=torch.int64).float().to(device) / dim)
-        )
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).to(device) / dim))
         # 注册为 buffer，确保在 model.to(device) 时跟随转移，并避免 meta tensor 问题
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
@@ -224,15 +221,22 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config: T6Config):
         super().__init__()
-        # Calculate the floored hidden dimension size
-        hidden_dim = math.floor(8 / 3 * config.hidden_size)
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
 
         # Split the linear projection into two parts for SwiGLU
-        self.c_fc1 = nn.Linear(config.hidden_size, hidden_dim, bias=config.mlp_bias)
-        self.c_fc2 = nn.Linear(config.hidden_size, hidden_dim, bias=config.mlp_bias)
+        self.c_fc1 = nn.Linear(
+            config.hidden_size, self.intermediate_size, bias=config.mlp_bias
+        )
+        self.c_fc2 = nn.Linear(
+            config.hidden_size, self.intermediate_size, bias=config.mlp_bias
+        )
 
         # Output projection
-        self.c_proj = nn.Linear(hidden_dim, config.hidden_size, bias=config.mlp_bias)
+        self.c_proj = nn.Linear(
+            self.intermediate_size, config.hidden_size, bias=config.mlp_bias
+        )
         self.act_fn = ACT2FN[config.hidden_act]
 
         self.c_proj.weight.data.zero_()  # zero init suggested by @Grad62304977
@@ -335,38 +339,6 @@ class T6Model(T6PreTrainedModel):
             # attentions=all_self_attns,
         )
         return output
-
-    def crop_block_size(self, block_size):
-        # model surgery to decrease the block size if necessary
-        # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
-        # but want to use a smaller block size for some smaller, simpler model
-        # assert block_size <= self.config.block_size
-        # self.config.block_size = block_size
-        # self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
-        # for block in self.transformer.h:
-        #     block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
-        pass
-
-    def estimate_mfu(self, fwdbwd_per_iter, dt):
-        """estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS"""
-        # first estimate the number of flops we do per iteration.
-        # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
-        N = self.get_num_params()
-        cfg = self.config
-        L, H, Q, T = (
-            cfg.num_hidden_layers,
-            cfg.n_head,
-            cfg.hidden_size // cfg.n_head,
-            cfg.block_size,
-        )
-        flops_per_token = 6 * N + 12 * L * H * Q * T
-        flops_per_fwdbwd = flops_per_token * T
-        flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
-        # express our flops throughput as ratio of A100 bfloat16 peak flops
-        flops_achieved = flops_per_iter * (1.0 / dt)  # per second
-        flops_promised = 312e12  # A100 GPU bfloat16 peak flops is 312 TFLOPS
-        mfu = flops_achieved / flops_promised
-        return mfu
 
     def get_num_params(self, non_embedding=True):
         """

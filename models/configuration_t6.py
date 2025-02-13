@@ -10,22 +10,22 @@ class T6Config(PretrainedConfig):
     def __init__(
         self,
         vocab_size: int = 50304,
-        hidden_size: int = 768,  # Fixed embedding dimension
+        hidden_size: int = 2560,  # Fixed embedding dimension
+        intermediate_size: int = 2048,
         num_hidden_layers: int = 12,
         num_attention_heads: int = 22,  # Number of attention heads
+        hidden_act="silu",
         initializer_range: float = 0.02,
         rms_norm_eps: float = 1e-6,
-        use_cache=True,
-        pad_token_id=None,
-        bos_token_id=1,
-        eos_token_id=2,
-        pretraining_tp=1,
-        tie_word_embeddings=False,
+        use_cache: bool = True,
+        pad_token_id: int = None,
+        bos_token_id: int = 1,
+        eos_token_id: int = 2,
+        pretraining_tp: int = 1,
+        tie_word_embeddings: bool = False,
         rank: int = 2,  # CP rank for key and value
         q_rank: int = 6,  # CP rank for query
-        block_size: int = 1024,  # Maximum sequence length
         attention_bias: bool = False,
-        bias: bool = False,  # Use bias in all linear layers
         dropout: float = 0.0,  # Dropout rate
         scale_attn_by_inverse_layer_idx: bool = (
             False  # Scale attention by 1/sqrt(layer_idx)
@@ -39,6 +39,8 @@ class T6Config(PretrainedConfig):
         self.hidden_size = hidden_size
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
+        self.hidden_act = hidden_act
+        self.intermediate_size = intermediate_size
         self.initializer_range = initializer_range
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
@@ -49,18 +51,13 @@ class T6Config(PretrainedConfig):
         self.tie_word_embeddings = tie_word_embeddings
         self.rank = rank
         self.q_rank = q_rank
-        self.block_size = block_size
         self.attention_bias = attention_bias
-        self.bias = bias
         self.dropout = dropout
         self.scale_attn_by_inverse_layer_idx = scale_attn_by_inverse_layer_idx
         self.using_groupnorm = using_groupnorm
         self.mlp_bias = mlp_bias
-        self.head_dim = (
-            head_dim
-            if head_dim is not None
-            else self.hidden_size // self.num_attention_heads
-        )
+        self.head_dim = head_dim
+
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
