@@ -1,3 +1,4 @@
+import logging
 import math
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
@@ -15,6 +16,8 @@ from transformers.modeling_outputs import (
 )
 
 from models.configuration_t6 import T6Config
+
+logger = logging.getLogger(__name__)
 
 
 class Rotary(torch.nn.Module):
@@ -174,9 +177,10 @@ class CPLinear(nn.Module):
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, config: T6Config):
+    def __init__(self, config: T6Config, layer_idx: int):
         super().__init__()
         self.config = config
+        self.layer_idx = layer_idx
         self.n_head = config.num_attention_heads
         self.head_dim = config.head_dim
 
@@ -255,18 +259,20 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config: T6Config):
+    def __init__(self, config: T6Config, layer_idx: int):
         super().__init__()
         self.config = config
-        self.attn = CausalSelfAttention(config)
+        self.rms_norm_eps = config.rms_norm_eps
+
+        self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
     def forward(self, x):
-        norm1 = F.rms_norm(x, (x.size(-1),), eps=self.config.rms_norm_eps)
+        norm1 = F.rms_norm(x, (x.size(-1),), eps=self.rms_norm_eps)
         attn_out = self.attn(norm1)
         x = x + attn_out
 
-        norm2 = F.rms_norm(x, (x.size(-1),), eps=self.config.rms_norm_eps)
+        norm2 = F.rms_norm(x, (x.size(-1),), eps=self.rms_norm_eps)
         mlp_out = self.mlp(norm2)
         x = x + mlp_out
         return x
@@ -299,7 +305,7 @@ class T6Model(T6PreTrainedModel):
             config.vocab_size, config.hidden_size, self.padding_idx
         )
         self.layers = nn.ModuleList(
-            [Block(config) for _ in range(config.num_hidden_layers)]
+            [Block(config, i) for i in range(config.num_hidden_layers)]
         )
 
         self.gradient_checkpointing = False
