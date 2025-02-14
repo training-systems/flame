@@ -24,8 +24,6 @@ from flame.optimizer import build_lr_schedulers, build_optimizers
 from flame.parallelisms.parallelize_fla import parallelize_fla
 from flame.parallelisms.pipeline_fla import pipeline_fla
 from flame.utils import device_module, device_type
-from models.configuration_t6 import T6Config
-from models.modeling_t6 import T6ForCausalLM, T6Model
 from torchtitan.float8 import Float8Handler
 from torchtitan.logging import init_logger, logger
 from torchtitan.parallelisms import ParallelDims
@@ -101,11 +99,7 @@ def main(job_config: JobConfig):
     )
 
     min_num_shards = dp_degree * job_config.training.num_workers
-
     if len(job_config.training.dataset.split(',')) == 1:
-        logger.info(f"[DEBUG] job_config.training.dataset, {job_config.training.dataset}")
-        logger.info(f"[DEBUG] job_config.training.dataset_name, {job_config.training.dataset_name}")
-    
         dataset = load_dataset(
             path=job_config.training.dataset,
             name=getattr(job_config.training, 'dataset_name', None),
@@ -131,7 +125,7 @@ def main(job_config: JobConfig):
                     f"Dataset {job_config.training.dataset} has insufficient shards ({dataset.num_shards}). "
                     f"Need {min_num_shards} shards minimum for {dp_degree} data parallel workers × "
                     f"{job_config.training.num_workers} dataloader workers. "
-                    f"Resharding dataset to {min_num_shards} shards and disabling streaming mode."
+                    f"Disabling the streaming mode and resharding dataset to {min_num_shards} shards."
                     f"{color.reset}"
                 )
                 dataset = (
@@ -268,18 +262,27 @@ def main(job_config: JobConfig):
     )
 
     logger.info(f"Loading model config from {job_config.model.config}")
-    # model_config = AutoConfig.from_pretrained(job_config.model.config)
-    model_config = T6Config.from_pretrained(job_config.model.config)
+    model_config = AutoConfig.from_pretrained(job_config.model.config)
     # set the model configs from training inputs:
     # 1. norm type to decide which norm layer to use
-    # 2. vocab size from tokenizer
-    # 3. context_len base on inputs
-    model_config.vocab_size = len(tokenizer.get_vocab())
+    # 2. disable fused norm if TP is enabled
+    # 3. vocab size from tokenizer
+    # 4. context_len base on inputs
+    if parallel_dims.tp_enabled and model_config.fuse_norm:
+        logger.warning(
+            f"{color.red}"
+            f"Fused norm is not compatible with tensor parallelism. "
+            f"Disabling it for now."
+            f"{color.reset}"
+        )
+        model_config.fuse_norm = False
+        model_config.fuse_swiglu = False
+        model_config.fuse_cross_entropy = False
+    model_config.vocab_size = tokenizer.vocab_size
 
     logger.info(f"Building model from the config\n{color.green}{model_config}{color.reset}")
     with torch.device('meta'):
-        # model = AutoModelForCausalLM.from_config(model_config)
-        model = T6ForCausalLM(model_config)
+        model = AutoModelForCausalLM.from_config(model_config)
         # defer weight initialization until after parallelisms are applied
         model.apply(lambda m: setattr(m, '_is_hf_initialized', False))
     logger.info(f"{color.blue}\n{model}{color.reset}\n")
@@ -294,7 +297,7 @@ def main(job_config: JobConfig):
     num_flop_per_token = utils.get_num_flop_per_token(
         utils.get_num_params(model, exclude_embedding=True),
         model_config,
-        job_config.training.seq_len,
+        job_config.training.context_len,
     )
 
     # move sharded model to CPU/GPU and initialize weights via DTensor
@@ -435,6 +438,7 @@ def main(job_config: JobConfig):
                 data_load_start = time.perf_counter()
                 batch = next(data_iterator)
                 input_ids, labels = batch['input_ids'], batch['labels']
+
                 ntokens_since_last_log += labels.numel()
                 data_loading_times.append(time.perf_counter() - data_load_start)
 
