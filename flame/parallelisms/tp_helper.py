@@ -14,12 +14,14 @@ except ImportError:
     Float8ColwiseParallel = None
     Float8RowwiseParallel = None
     PrepareFloat8ModuleInput = None
-
+from fla.modules.fused_linear_cross_entropy import LinearLossParallel
+from fla.modules.mlp import SwiGLULinearParallel
+from fla.modules.parallel import PrepareModuleWeight
 
 TP_PLANS = dict()
 
 
-def dispatch_tp_plan(model, enable_float8=False, loss_parallel=False):
+def dispatch_tp_plan(model, loss_parallel=False, enable_float8=False):
     model_name = model.__class__.__name__
     if model_name in TP_PLANS:
         plan_obj = TP_PLANS[model_name]
@@ -142,18 +144,27 @@ class FLATransformerPlan(FlameTPPlan):
 
     @property
     def others_plan(self):
-        return {
+        plans = {
             f"{self.base_model_prefix}.embeddings": RowwiseParallel(
                 input_layouts=Replicate(),
                 output_layouts=Shard(1),
             ),
             f"{self.base_model_prefix}.norm": SequenceParallel(),
-            "lm_head": ColwiseParallel(
-                input_layouts=Shard(1),
-                output_layouts=Shard(-1) if self.loss_parallel else Replicate(),
-                use_local_output=not self.loss_parallel,
-            ),
         }
+        if self.loss_parallel:
+            plans.update({
+                "lm_head": ColwiseParallel(
+                    input_layouts=Shard(1),
+                    output_layouts=Shard(-1) if self.loss_parallel else Replicate(),
+                    use_local_output=not self.loss_parallel,
+                ),
+            })
+        else:
+            plans.update({
+                "lm_head": PrepareModuleWeight(layouts=Replicate()),
+                "criterion": LinearLossParallel()
+            })
+        return plans
 
     @property
     def layer_plan(self):
@@ -179,6 +190,9 @@ class FLATransformerPlan(FlameTPPlan):
             "mlp.gate_proj": self.colwise_parallel(),
             "mlp.up_proj": self.colwise_parallel(),
             "mlp.down_proj": self.rowwise_parallel(output_layouts=Shard(1)),
+            "mlp.swiglu_linear": SwiGLULinearParallel(
+                output_layouts=Shard(1)
+            )
         }
 
         return plans
@@ -189,11 +203,3 @@ register_tp_plan("LlamaDecoderLayer", LlamaPlan)
 
 register_tp_plan("TransformerBlock", FLATransformerPlan)
 register_tp_plan("TransformerForCausalLM", FLATransformerPlan)
-
-# We need to `fix` stuffs on upstream FLA libs to use the above plan
-# e.g.
-# Use Naive RMSNorm
-# Use Naive SwiGLU
-# Disable Cross-entity fusion
-# Reshape QKV via head-dim instead of num-heads
-# remove attn's compile decorator
